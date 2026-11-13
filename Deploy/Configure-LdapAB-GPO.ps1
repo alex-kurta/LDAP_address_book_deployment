@@ -16,6 +16,10 @@
 .PARAMETER TargetOU
     Distinguished name of the OU to link. Defaults to TARGET_OU in .env.
 
+.PARAMETER LinkAtDomainRoot
+    Link the GPO at the domain root, which applies it company-wide. This
+    overrides TargetOU.
+
 .PARAMETER ScriptPath
     Full UNC path to Deploy-LdapAB.ps1. Defaults to the NETLOGON path.
 
@@ -24,6 +28,9 @@
 
 .PARAMETER DomainFqdn
     DNS domain name used for the SYSVOL policy path. Derived from .env when omitted.
+
+.PARAMETER SkipSynchronousScripts
+    Do not enable the Run logon scripts synchronously policy.
 #>
 
 [CmdletBinding()]
@@ -33,7 +40,9 @@ param(
     [string]$TargetOU = '',
     [string]$ScriptPath = '',
     [string]$DomainController = '',
-    [string]$DomainFqdn = ''
+    [string]$DomainFqdn = '',
+    [switch]$LinkAtDomainRoot,
+    [switch]$SkipSynchronousScripts
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,6 +74,15 @@ if ([string]::IsNullOrWhiteSpace($DomainFqdn) -and $settings) { $DomainFqdn = $s
 if ([string]::IsNullOrWhiteSpace($DomainFqdn) -and -not [string]::IsNullOrWhiteSpace($TargetOU)) {
     $DomainFqdn = Get-DomainFqdnFromDistinguishedName -DistinguishedName $TargetOU
 }
+if ($LinkAtDomainRoot) {
+    if ([string]::IsNullOrWhiteSpace($DomainFqdn)) {
+        $message = 'Cannot determine DomainFqdn for -LinkAtDomainRoot.'
+        if ($envError) { $message = "$message $envError" }
+        Write-Host "[ERROR] $message" -ForegroundColor Red
+        exit 1
+    }
+    $TargetOU = Get-DistinguishedNameFromDomainFqdn -DomainFqdn $DomainFqdn
+}
 if ([string]::IsNullOrWhiteSpace($ScriptPath) -and -not [string]::IsNullOrWhiteSpace($DomainController)) {
     $ScriptPath = "\\$DomainController\NETLOGON\LdapABDeploy\Deploy-LdapAB.ps1"
 }
@@ -88,50 +106,44 @@ if ([string]::IsNullOrWhiteSpace($DomainFqdn)) {
     exit 1
 }
 
-if ($settings) {
-    $displayName = $settings.DisplayName
-} else {
-    $displayName = 'LDAP Address Book'
-}
-
 try {
-    Import-Module GroupPolicy -ErrorAction Stop
+    $result = Invoke-LdapABGpoConfiguration `
+        -GPOName $GPOName `
+        -TargetOU $TargetOU `
+        -ScriptPath $ScriptPath `
+        -DomainFqdn $DomainFqdn `
+        -DomainController $DomainController `
+        -SkipSynchronousScripts:$SkipSynchronousScripts
 
-    $gpo = Get-GPO -Name $GPOName -ErrorAction SilentlyContinue
-    if (-not $gpo) {
-        Write-Host "Creating GPO: $GPOName" -ForegroundColor Green
-        $gpo = New-GPO -Name $GPOName -Comment "Deploy $displayName LDAP Address Book to Outlook via MAPI"
+    if ($result.Created) {
+        Write-Host "Created GPO: $($result.GPOName)" -ForegroundColor Green
     } else {
-        Write-Host "GPO already exists: $GPOName" -ForegroundColor Yellow
+        Write-Host "GPO already exists: $($result.GPOName)" -ForegroundColor Yellow
     }
-
-    $link = Get-GPLink -Name $GPOName -Target $TargetOU -ErrorAction SilentlyContinue
-    if (-not $link) {
-        Write-Host "Linking GPO to $TargetOU" -ForegroundColor Green
-        New-GPLink -Name $GPOName -Target $TargetOU -Enforced:$false | Out-Null
+    if ($result.Linked) {
+        Write-Host "Linked GPO to $($result.LinkTarget)" -ForegroundColor Green
     } else {
-        Write-Host "GPO already linked to $TargetOU" -ForegroundColor Yellow
+        Write-Host "GPO already linked to $($result.LinkTarget)" -ForegroundColor Yellow
     }
-
-    # Configure the user logon script through the GPO's psscripts.ini file.
-    $gpoPath = "\\$DomainController\SYSVOL\$DomainFqdn\Policies\$($gpo.Id)\User\Scripts\Logon"
-    New-Item -ItemType Directory -Path $gpoPath -Force | Out-Null
-
-    $scriptsIni = Join-Path $gpoPath 'psscripts.ini'
-    $iniContent = @"
-[Logon]
-0CmdLine=$ScriptPath
-0Parameters=
-"@
-
-    Set-Content -LiteralPath $scriptsIni -Value $iniContent -Encoding ASCII
     Write-Host "Configured logon script: $ScriptPath" -ForegroundColor Green
+    if ($result.LegacyScriptIniRemoved) {
+        Write-Host 'Removed the obsolete Scripts\Logon\psscripts.ini copy' -ForegroundColor Green
+    }
+    if ($result.ScriptsExtensionRegistered) {
+        Write-Host 'Registered the Group Policy Scripts client-side extension' -ForegroundColor Green
+    }
+    if ($result.SyncPolicySet) {
+        Write-Host 'Enabled: Run logon scripts synchronously' -ForegroundColor Green
+    }
+    if ($result.UserVersion -gt 0) {
+        Write-Host "GPO user version: $($result.UserVersion)" -ForegroundColor Green
+    }
 
     Write-Host "`nGPO Configuration Complete!" -ForegroundColor Green
-    Write-Host "GPO:         $GPOName"
-    Write-Host "Linked to:   $TargetOU"
+    Write-Host "GPO:         $($result.GPOName)"
+    Write-Host "GPO ID:      $($result.GpoId)"
+    Write-Host "Linked to:   $($result.LinkTarget)"
     Write-Host "Script:      $ScriptPath"
-    Write-Host "`nManually enable: User Configuration > Administrative Templates > System > Scripts > Run logon scripts synchronously" -ForegroundColor Cyan
 } catch {
     Write-Host "[ERROR] GPO configuration failed: $($_.Exception.Message)" -ForegroundColor Red
     exit 1

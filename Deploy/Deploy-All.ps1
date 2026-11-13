@@ -240,33 +240,34 @@ if ($SkipGPO -or $SkipCopy) {
 } elseif ([string]::IsNullOrWhiteSpace($settings.TargetOU)) {
     Write-Warn 'TARGET_OU is empty - GPO not created or linked'
 } elseif (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
-    Write-Warn 'GroupPolicy module not available'
-    Write-Warn 'Run Configure-LdapAB-GPO.ps1 on a domain controller with RSAT installed'
+    Write-Warn 'GroupPolicy module not available on this machine'
+    Write-Warn 'Run Configure-LdapAB-GPO-Remote.ps1 to create and link the GPO through WinRM'
 } else {
     try {
-        Import-Module GroupPolicy -ErrorAction Stop
+        $gpoResult = Invoke-LdapABGpoConfiguration `
+            -GPOName $settings.GpoName `
+            -TargetOU $settings.TargetOU `
+            -ScriptPath $scriptFullPath `
+            -DomainFqdn $settings.DomainFqdn `
+            -DomainController $settings.DomainController
 
-        $gpo = Get-GPO -Name $settings.GpoName -ErrorAction SilentlyContinue
-        if (-not $gpo) {
-            $gpo = New-GPO -Name $settings.GpoName -Comment "Deploy $($settings.DisplayName) LDAP Address Book"
-            Write-Ok "Created GPO: $($settings.GpoName)"
+        if ($gpoResult.Created) {
+            Write-Ok "Created GPO: $($gpoResult.GPOName)"
         } else {
-            Write-Ok "GPO already exists: $($settings.GpoName)"
+            Write-Ok "GPO already exists: $($gpoResult.GPOName)"
         }
-
-        $link = Get-GPLink -Name $settings.GpoName -Target $settings.TargetOU -ErrorAction SilentlyContinue
-        if (-not $link) {
-            New-GPLink -Name $settings.GpoName -Target $settings.TargetOU -Enforced:$false | Out-Null
-            Write-Ok "Linked GPO to $($settings.TargetOU)"
+        if ($gpoResult.Linked) {
+            Write-Ok "Linked GPO to $($gpoResult.LinkTarget)"
         } else {
-            Write-Ok "GPO already linked to $($settings.TargetOU)"
+            Write-Ok "GPO already linked to $($gpoResult.LinkTarget)"
         }
-
-        Write-Warn "Enable 'Run logon scripts synchronously' in the GPO"
-        Write-Warn "Logon script: $scriptFullPath"
+        Write-Ok "Configured logon script: $scriptFullPath"
+        if ($gpoResult.SyncPolicySet) {
+            Write-Ok "Enabled 'Run logon scripts synchronously'"
+        }
     } catch {
         Write-Fail "GPO configuration failed: $($_.Exception.Message)"
-        Write-Warn 'Use Configure-LdapAB-GPO.ps1 on the domain controller, or configure the GPO manually.'
+        Write-Warn 'Use Configure-LdapAB-GPO-Remote.ps1 or configure the GPO manually.'
     }
 }
 

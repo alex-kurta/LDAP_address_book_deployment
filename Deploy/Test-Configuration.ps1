@@ -108,6 +108,7 @@ try {
         'DeploymentHelpers.ps1',
         'Deploy-All.ps1',
         'Configure-LdapAB-GPO.ps1',
+        'Configure-LdapAB-GPO-Remote.ps1',
         'Deploy-LdapAB.ps1',
         'Remove-LdapAB.ps1',
         'Test-Configuration.ps1'

@@ -6,6 +6,33 @@ This document describes how an LDAP address book is deployed from Active
 Directory to Outlook clients through Group Policy. Environment-specific values
 are stored in a local `.env` file and are never committed to the repository.
 
+## Reference Deployment Status (verified 2026-11-13)
+
+The deployment was completed and validated in a reference Active Directory
+environment. Environment-specific host names, domain names, GPO identifiers,
+and account names have been removed from this public document.
+
+| Item | Status |
+|------|--------|
+| `Outlook LDAP Address Book Deployment` GPO | Created and linked at the domain root (not enforced) |
+| User logon script | `User\Scripts\psscripts.ini`, UTF-16LE with BOM |
+| Scripts CSE | Registered; `RunLogonScriptSync=1` |
+| NETLOGON `ABConfiguration.xml` | Matches `.env`, no credentials |
+| NETLOGON `Deploy-LdapAB.ps1` / `Remove-LdapAB.ps1` | Match the repository |
+| GPO applies on the reference workstation | Yes (2026-11-13) |
+| Address book on the reference workstation | Deployed (`%TEMP%\LdapABDeploy.log`, registry marker present) |
+| `TARGET_OU` | Configured OU did not exist; domain root used instead |
+| RSAT on the administrative workstation | Not installed |
+| WinRM to the domain controller | Working with the deployment credentials |
+| GroupPolicy module on the domain controller | Installed (Server 2016; has `Get-GPInheritance`, no `Get-GPLink`) |
+| Secondary Samba DC | SMB session setup failed; SYSVOL mirror was empty |
+
+The GPO applied on the Windows DC and on the reference workstation. However,
+clients whose DFS referral for the domain SYSVOL path landed on the secondary
+Samba DC could not read `gpt.ini` and would fail policy processing until that
+controller's SMB service and SYSVOL mirror were repaired. See "Known
+Limitations".
+
 ## Problem Statement
 
 - Users run Outlook 2016/2019/2021 or Microsoft 365.
@@ -93,8 +120,9 @@ already, so this is a completeness feature rather than a requirement.
 - `ABConfiguration.xml` — generic template, rendered at deploy time
 - `Deploy-LdapAB.ps1` — client logon script
 - `Remove-LdapAB.ps1` — rollback script
-- `Configure-LdapAB-GPO.ps1` — GPO automation
-- `Deploy-All.ps1` — end-to-end deployment automation
+- `Configure-LdapAB-GPO.ps1` — local GPO automation (DC or RSAT)
+- `Configure-LdapAB-GPO-Remote.ps1` — GPO automation through WinRM
+- `Deploy-All.ps1` — NETLOGON package deployment automation
 - `DeploymentHelpers.ps1` — shared `.env` and configuration helpers
 - `Test-Configuration.ps1` — safe smoke test
 - `GPO-DEPLOYMENT-GUIDE.md` — manual instructions
@@ -172,16 +200,51 @@ LdapABManager_x86.exe
 
 ### 8. GPO Configuration
 
-**Automated options:**
+The GPO is a separate step from the NETLOGON copy. In this environment it is
+already created and linked; the commands below update it in place or recreate
+it if necessary.
 
-- `Deploy-All.ps1` creates and links the GPO when the GroupPolicy module is
-  available and `TARGET_OU` is set.
-- `Configure-LdapAB-GPO.ps1` performs the same steps standalone on a domain
-  controller or RSAT workstation.
+**Choose the link scope:**
+
+- **Company-wide:** link at the domain root (for example,
+  `DC=example,DC=com`). This applies to all domain users unless an OU blocks
+  inheritance.
+- **Pilot:** link to a real OU distinguished name.
+- In the reference environment, the configured `TARGET_OU` did not exist, so
+  domain-root linking was used instead.
+
+**Remote automation (no RSAT on the administrative workstation):**
+
+```powershell
+# Preview
+.\Deploy\Configure-LdapAB-GPO-Remote.ps1 -DryRun -LinkAtDomainRoot
+
+# Apply company-wide
+.\Deploy\Configure-LdapAB-GPO-Remote.ps1 -LinkAtDomainRoot
+
+# Or link to a real pilot OU
+.\Deploy\Configure-LdapAB-GPO-Remote.ps1 -TargetOU 'OU=Pilot,DC=example,DC=com'
+```
+
+The script connects to the domain controller through WinRM with the deployment
+credentials from `.env`. It creates the GPO if needed, links it, writes the
+user logon script to `User\Scripts\psscripts.ini` (UTF-16LE with BOM),
+registers the Scripts client-side extension, enables synchronous logon
+scripts, and bumps the GPO version so clients reprocess the policy.
+
+**Local automation (DC or RSAT workstation):**
+
+```powershell
+.\Deploy\Configure-LdapAB-GPO.ps1 -LinkAtDomainRoot
+```
+
+`Deploy-All.ps1` runs the local automation automatically only when the
+GroupPolicy module is installed on the workstation. It does not create the GPO
+from a machine without RSAT; use the remote script for that.
 
 **Manual steps via GPMC:**
 
-1. Create a GPO and link it to the target OU.
+1. Create a GPO and link it to the domain root or a pilot OU.
 2. Edit the GPO → **User Configuration → Policies → Windows Settings → Scripts
    (Logon/Logoff)**.
 3. Add a PowerShell logon script:
@@ -233,6 +296,7 @@ LdapABManager_x86.exe
 └── Deploy/
     ├── ABConfiguration.xml       # Generic client template
     ├── Configure-LdapAB-GPO.ps1
+    ├── Configure-LdapAB-GPO-Remote.ps1
     ├── Deploy-All.ps1
     ├── Deploy-LdapAB.ps1
     ├── DeploymentHelpers.ps1
@@ -245,7 +309,21 @@ LdapABManager_x86.exe
 
 ## Known Limitations
 
-- GPO creation requires the GroupPolicy module (RSAT).
+- In the reference environment, a secondary Samba DC populated its SYSVOL with
+  a robocopy mirror from the Windows DC rather than DFSR. As of 2026-11-13 its
+  SMB service rejected session setup with "The security ID structure is
+  invalid" (for both standard users and domain admins), so its SYSVOL/NETLOGON
+  shares were unreachable. The scheduled robocopy mirror task on the Windows DC
+  had also been stuck since 2026-11-11 23:30; `MultipleInstances=IgnoreNew`
+  skipped all retries. Repair the Samba SMB service and SID mapping, then stop
+  any hung robocopy process so the mirror can run. Windows-only diagnostics
+  such as `dcdiag`, `dfsrdiag`, WMI, and WinRM do not apply to Samba.
+- GPO creation needs either the GroupPolicy module locally or WinRM access to a
+  domain controller that has it.
+- `Get-GPLink` is not present in the Windows Server 2016 GroupPolicy module.
+  The scripts use `Get-GPInheritance` instead.
+- The Scripts CSE requires `User\Scripts\psscripts.ini` encoded as UTF-16LE
+  with a BOM. ASCII files and the `Scripts\Logon` path are ignored.
 - NETLOGON write access may require explicit credentials.
 - The deployment package must be re-rendered when `.env` changes.
 - Rewriting Git history is required if a secret was committed before it was
@@ -254,9 +332,13 @@ LdapABManager_x86.exe
 ## Next Steps
 
 1. Fill in `.env` and run `Deploy\Test-Configuration.ps1`.
-2. Run `Deploy\Deploy-All.ps1` or copy the package manually.
-3. Create and link the GPO if it was not automated.
-4. Pilot the deployment on a test OU.
-5. Monitor `%TEMP%\LdapABDeploy.log` on pilot machines.
-6. Roll out to production OUs.
+2. Run `Deploy\Deploy-All.ps1` to refresh the NETLOGON package.
+3. Run `Deploy\Configure-LdapAB-GPO-Remote.ps1 -DryRun`, then apply it without
+   `-DryRun` to create or update the GPO.
+4. Verify the GPO link, `User\Scripts\psscripts.ini` encoding, Scripts CSE
+   registration, and that the AD `versionNumber` matches `gpt.ini`.
+5. Repair or reconcile any secondary domain controller so workstations that
+   authenticate through it can read SYSVOL and process domain GPOs.
+6. Pilot the deployment on a test machine, then monitor
+   `%TEMP%\LdapABDeploy.log`.
 7. Optionally enable LDAPS (port 636) with a valid certificate.
