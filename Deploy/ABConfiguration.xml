@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ABConfiguration>
+  <DisplayName>Company Directory</DisplayName>
+  <ServerName>ldap.example.com</ServerName>
+  <ServerPort>389</ServerPort>
+  <UseSSL>False</UseSSL>
+  <Username></Username>
+  <Password></Password>
+  <RequireSecurePasswordAuth>True</RequireSecurePasswordAuth>
+  <SearchTimeoutSeconds>60</SearchTimeoutSeconds>
+  <MaxEntriesReturned>500</MaxEntriesReturned>
+  <DefaultSearchBase>True</DefaultSearchBase>
+  <CustomSearchBase></CustomSearchBase>
+  <EnableBrowsing>True</EnableBrowsing>
+</ABConfiguration>

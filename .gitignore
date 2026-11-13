@@ -1,0 +1,33 @@
+# Secrets / local environment
+.env
+.env.*
+!.env.example
+
+# Agent/tooling state
+.kilo/
+.venv/
+
+# Build outputs
+LdapABManager_Code/x64/
+LdapABManager_Code/Debug/
+LdapABManager_Code/Release/
+LdapABManager_Code/*.obj
+LdapABManager_Code/*.pch
+LdapABManager_Code/*.pdb
+LdapABManager_Code/*.ilk
+LdapABManager_Code/*.exe
+LdapABManager_Code/*.aps
+
+# Local staging
+Build/
+Deploy/staging/
+
+# User-specific
+LdapABManager_Code/*.user
+LdapABManager_Code/*.vspscc
+
+# Logs
+*.log
+
+# Temp
+*.tmp
