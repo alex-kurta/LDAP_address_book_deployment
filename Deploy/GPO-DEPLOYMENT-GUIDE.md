@@ -34,7 +34,7 @@ from this public document.
 | RSAT on the administrative workstation | Not installed |
 | WinRM to the domain controller | Working with the deployment credentials |
 | GroupPolicy module on the domain controller | Installed (Windows Server 2016; use `Get-GPInheritance`) |
-| Secondary Samba DC | SMB session setup failed; SYSVOL mirror was empty |
+| Secondary Samba DC | SMB session setup failed; SYSVOL mirror was empty (superseded — see "Current Status Addendum (verified 2026-11-16)") |
 
 ### Known infrastructure limitation: Samba SYSVOL mirror
 
@@ -381,10 +381,32 @@ Remove-Item "HKCU:\Software\<DOMAIN>\LdapABDeploy" -Recurse -Force
 - **Removal log**: `%TEMP%\LdapABRemove.log`
 - **Registry marker**: `HKCU\Software\<DOMAIN>\LdapABDeploy`
 
+## Current Status Addendum (verified 2026-11-16)
+
+The Samba SYSVOL mirror limitation described above is **resolved**: the
+Windows-to-Samba robocopy mirror task has been run and SYSVOL hashes now
+match on both DCs. The scheduled-task preference that actually drives the
+deployment has been hardened:
+
+| Item | Status |
+|------|--------|
+| Task launcher | `conhost.exe --headless cmd.exe /c "...\Run-LdapAB.cmd"` — no console window |
+| OS targeting | Item-level WMI targeting, `Version >= '10.0.17763'` (Windows 10 1809+/11); item removes itself off-filter |
+| GPO version | `393221` on both DCs (AD `versionNumber` and `GPT.INI` agree; `ntacl sysvolcheck` passes) |
+| Clients confirmed | Reference clients verified running hidden with result `0` |
+| Legacy clients | Server 2016 DC stale task stopped/removed; no task is re-created off-filter |
+| Client default AB | `VERIFIED default and search order` in `%TEMP%\LdapABDeploy.log` |
+
+If a client still shows a console window, force `gpupdate /target:user /force`
+in that user's session and confirm the control-flow: task action should be
+`conhost.exe --headless`. See `DEPLOYMENT_PROCESS.md` → "Addendum: Production
+hardening (2026-11-16)" for the full record.
+
 ## Version History
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.4 | 2026-11-16 | Samba SYSVOL mirror repaired and verified; hidden `conhost.exe --headless` task launcher; Windows 10 1809+ WMI item-level targeting with removePolicy; GPO version `393221`; clients confirmed hidden; stale Server 2016 task removed |
 | 1.3 | 2026-11-13 | GPO created and linked at the domain root; corrected `psscripts.ini` path, UTF-16LE encoding, Scripts CSE registration, and version handling; documented a Samba SYSVOL mirror limitation observed in the reference environment |
 | 1.2 | 2026-11-12 | Corrected GPO status; added WinRM remote GPO script; fixed link checks; documented missing `TARGET_OU` |
 | 1.1 | 2026-11-12 | `.env`-driven configuration, safe smoke test, sanitized package |

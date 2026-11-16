@@ -25,7 +25,7 @@ and account names have been removed from this public document.
 | RSAT on the administrative workstation | Not installed |
 | WinRM to the domain controller | Working with the deployment credentials |
 | GroupPolicy module on the domain controller | Installed (Server 2016; has `Get-GPInheritance`, no `Get-GPLink`) |
-| Secondary Samba DC | SMB session setup failed; SYSVOL mirror was empty |
+| Secondary Samba DC | SMB session setup failed; SYSVOL mirror was empty (superseded — see "Addendum: Production hardening (2026-11-16)") |
 
 The GPO applied on the Windows DC and on the reference workstation. However,
 clients whose DFS referral for the domain SYSVOL path landed on the secondary
@@ -279,7 +279,7 @@ from a machine without RSAT; use the remote script for that.
 
 ### Idempotency
 
-- Registry marker: `HKCU\Software\<DOMAIN>\LdapABDeploy` with `Version=1.0`
+- Registry marker: `HKCU\Software\<DOMAIN>\LdapABDeploy` with `Version=2.0`
 - LdapABManager checks for an existing address book by display name
 - Safe to run multiple times
 
@@ -310,14 +310,11 @@ from a machine without RSAT; use the remote script for that.
 ## Known Limitations
 
 - In the reference environment, a secondary Samba DC populated its SYSVOL with
-  a robocopy mirror from the Windows DC rather than DFSR. As of 2026-11-13 its
+  a robocopy mirror from the Windows DC rather than DFSR. On 2026-11-13 its
   SMB service rejected session setup with "The security ID structure is
   invalid" (for both standard users and domain admins), so its SYSVOL/NETLOGON
-  shares were unreachable. The scheduled robocopy mirror task on the Windows DC
-  had also been stuck since 2026-11-11 23:30; `MultipleInstances=IgnoreNew`
-  skipped all retries. Repair the Samba SMB service and SID mapping, then stop
-  any hung robocopy process so the mirror can run. Windows-only diagnostics
-  such as `dcdiag`, `dfsrdiag`, WMI, and WinRM do not apply to Samba.
+  shares were unreachable. That failure is **resolved as of 2026-11-16** —
+  see "Addendum: Production hardening (2026-11-16)" for the current state.
 - GPO creation needs either the GroupPolicy module locally or WinRM access to a
   domain controller that has it.
 - `Get-GPLink` is not present in the Windows Server 2016 GroupPolicy module.
@@ -336,9 +333,58 @@ from a machine without RSAT; use the remote script for that.
 3. Run `Deploy\Configure-LdapAB-GPO-Remote.ps1 -DryRun`, then apply it without
    `-DryRun` to create or update the GPO.
 4. Verify the GPO link, `User\Scripts\psscripts.ini` encoding, Scripts CSE
-   registration, and that the AD `versionNumber` matches `gpt.ini`.
-5. Repair or reconcile any secondary domain controller so workstations that
-   authenticate through it can read SYSVOL and process domain GPOs.
-6. Pilot the deployment on a test machine, then monitor
-   `%TEMP%\LdapABDeploy.log`.
-7. Optionally enable LDAPS (port 636) with a valid certificate.
+   registration, and that the AD `versionNumber` matches `gpt.ini` (kept at
+   `393221` since 2026-11-16; Samba and Windows DC agree).
+5. Optionally pilot any *new* configuration change on a test machine first;
+   the current deployment is live in production and monitoring
+   `%TEMP%\LdapABDeploy.log` is the primary health signal.
+6. Optionally enable LDAPS (port 636) with a valid certificate.
+
+## Addendum: Production hardening (2026-11-16)
+
+The deployment was running but employees reported a console window flashing
+every 15 minutes. The scheduled-task preference that drives the deployment was
+hardened and re-targeted. These changes live in the deployed GPO preference
+item, not in this repository; environment-specific identifiers are not
+published here.
+
+### What changed
+
+1. **Hidden task launcher.** The task action changed from
+   `cmd.exe /c "\\<DOMAIN>\NETLOGON\LdapABDeploy\Run-LdapAB.cmd"` to
+   `C:\Windows\System32\conhost.exe --headless cmd.exe /c "...\Run-LdapAB.cmd"`.
+   Verified on a Windows 11 build 26200 client: both `conhost.exe` and
+   `cmd.exe` reported `MainWindowHandle=0` and an empty window title, and the
+   deployment still completed with `VERIFIED default and search order`.
+2. **OS targeting.** The preference item now carries item-level targeting: a
+   WMI filter `SELECT * FROM Win32_OperatingSystem WHERE Version >= '10.0.17763'`
+   (Windows 10 1809+ and Windows 11). The item is also configured to remove
+   itself where the filter stops matching. Windows 7/XP clients and the
+   Windows Server 2016 DC receive no task and show no window.
+3. **GPO version.** `GPT.INI` bumped from `393220` to `393221`, the Scripts /
+   Preferences CSE registrations were unchanged, and the AD `versionNumber`
+   was updated to match via `ldbmodify`/`Get-ADObject` on the Samba and
+   Windows DCs respectively. `samba-tool ntacl sysvolcheck` passes.
+4. **Samba SYSVOL mirror.** The Windows-to-Samba robocopy mirror task was run
+   and its outcome (`lastResult=1`, i.e. files copied) confirmed; SYSVOL hashes
+   for the GPO now match on both DCs.
+5. **Force-refresh of a stale client.** One reported PC still ran
+   the old `cmd.exe` action until a `gpupdate /target:user /force` (issued as
+   the affected user) replaced the local task with the headless one. Deleting
+   the local task on a reference workstation and forcing the refresh also
+   recreated it from the updated preference with no GPO processing errors.
+   The Windows Server 2016 DC had a stuck legacy task for the disconnected
+   Administrator session; it was stopped and removed, and it is not recreated
+   because the build fails the 1809+ filter.
+6. **Repository hygiene.** No credentials were committed; `.env` remains
+   gitignored; tracked files contain no copy of the `.env` password (verified
+   via tracked-file scan).
+
+### Why the preference approach
+
+A Group Policy Preferences scheduled task runs as the interactive user at
+logon and on a 15-minute repetition, so deployments recur for already logged-in
+and unlocked sessions without user action. Item-level targeting lets a single
+domain-linked GPO serve both modern and legacy clients without a separate OU
+or WMI-filter infrastructure.
+
