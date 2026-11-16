@@ -541,8 +541,11 @@ function Get-ClientDeploymentFiles {
         'ABConfiguration.xml',
         'Deploy-LdapAB.ps1',
         'Remove-LdapAB.ps1',
+        'Run-LdapAB.cmd',
         'LdapABManager_x64.exe',
-        'LdapABManager_x86.exe'
+        'LdapABManager_x86.exe',
+        'SetLdapABDefault_x64.exe',
+        'SetLdapABDefault_x86.exe'
     )
 }
 

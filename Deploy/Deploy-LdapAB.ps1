@@ -49,47 +49,67 @@ if (-not [string]::IsNullOrWhiteSpace($RegistryRoot)) {
 try {
     Write-Log 'Starting LDAP AB deployment'
 
-    # Check if already deployed (idempotency).
-    $alreadyDeployed = $false
-    if (Test-Path -LiteralPath $regPath) {
-        $version = Get-ItemProperty -LiteralPath $regPath -Name Version -ErrorAction SilentlyContinue
-        if ($version -and $version.Version -eq '1.0') {
-            $alreadyDeployed = $true
-        }
-    }
-
-    if ($alreadyDeployed) {
-        Write-Log 'Already deployed, skipping'
-        exit 0
-    }
-
     # Detect Outlook bitness.
     $outlookPath = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE' -ErrorAction SilentlyContinue).'(default)'
     if (-not $outlookPath -or -not (Test-Path -LiteralPath $outlookPath)) {
         $outlookPath = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE' -ErrorAction SilentlyContinue).'(default)'
     }
 
-    $use64 = $false
-    if ($outlookPath -and (Test-Path -LiteralPath $outlookPath)) {
+    # Office Click-to-Run records the platform explicitly. If that is not
+    # available, inspect the Outlook executable's PE header.
+    function Test-OutlookIs64Bit {
+        param([string]$Path)
+
         try {
-            $use64 = [System.Reflection.AssemblyName]::GetAssemblyName($outlookPath).ProcessorArchitecture -eq 'Amd64'
-        } catch {
-            $outlookProc = Get-Process OUTLOOK -ErrorAction SilentlyContinue
-            if ($outlookProc) {
-                $use64 = $outlookProc[0].StartInfo.EnvironmentVariables['PROCESSOR_ARCHITECTURE'] -eq 'AMD64'
-            } else {
-                $use64 = [Environment]::Is64BitOperatingSystem
-            }
+            $ctr = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction Stop
+            if ($ctr.Platform -eq 'x64') { return $true }
+            if ($ctr.Platform -eq 'x86') { return $false }
+        } catch {}
+
+        try {
+            $office = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Office\16.0\Outlook' -ErrorAction Stop
+            if ($office.Bitness -eq 'x64') { return $true }
+            if ($office.Bitness -eq 'x86') { return $false }
+        } catch {}
+
+        try {
+            $office32 = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\16.0\Outlook' -ErrorAction Stop
+            if ($office32.Bitness -eq 'x64') { return $true }
+            if ($office32.Bitness -eq 'x86') { return $false }
+        } catch {}
+
+        if ($Path -and (Test-Path -LiteralPath $Path)) {
+            try {
+                $stream = [System.IO.File]::OpenRead($Path)
+                try {
+                    $reader = New-Object System.IO.BinaryReader($stream)
+                    $stream.Position = 0x3C
+                    $peOffset = $reader.ReadInt32()
+                    $stream.Position = $peOffset + 4
+                    $machine = $reader.ReadUInt16()
+                } finally {
+                    $stream.Close()
+                }
+                if ($machine -eq 0x8664) { return $true }
+                if ($machine -eq 0x014C) { return $false }
+            } catch {}
         }
-    } else {
-        $use64 = [Environment]::Is64BitOperatingSystem
+
+        return [Environment]::Is64BitOperatingSystem
     }
+
+    $use64 = Test-OutlookIs64Bit -Path $outlookPath
 
     $exeName = if ($use64) { 'LdapABManager_x64.exe' } else { 'LdapABManager_x86.exe' }
     $exePath = Join-Path $PSScriptRoot $exeName
+    $helperName = if ($use64) { 'SetLdapABDefault_x64.exe' } else { 'SetLdapABDefault_x86.exe' }
+    $helperPath = Join-Path $PSScriptRoot $helperName
 
     if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
         throw "Executable not found: $exePath"
+    }
+    if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
+        throw "Default-address-book helper not found: $helperPath"
     }
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
         throw "Config not found: $ConfigPath"
@@ -105,43 +125,99 @@ try {
         throw "Config is missing the ABConfiguration root element: $ConfigPath"
     }
 
-    Write-Log "Using $exeName (64-bit: $use64)"
+    $displayName = [string]$configXml.ABConfiguration.DisplayName
+    if ([string]::IsNullOrWhiteSpace($displayName)) {
+        $displayName = 'Company Directory'
+    }
+
+    Write-Log "Using $exeName and $helperName (64-bit: $use64)"
     Write-Log "Config: $ConfigPath"
 
-    $managerArgs = @(
-        '-m', 'create',
-        '-f', $ConfigPath,
-        '-pm', 'default'
-    )
+    # Determine whether the address book already exists. This avoids running
+    # create on every scheduled-task pass while still repairing a profile that
+    # is missing the address book.
+    $addressBookExists = $false
+    $listResult = & $exePath -m list 2>&1
+    $listExit = $LASTEXITCODE
+    $listText = ($listResult | Out-String)
+    if ($listExit -eq 0 -and $listText -match [regex]::Escape($displayName)) {
+        $addressBookExists = $true
+    }
 
     if ($DryRun) {
-        Write-Log "Dry run: would execute $exeName in create mode"
+        if ($addressBookExists) {
+            Write-Log "Dry run: '$displayName' already exists; would verify the default address book"
+        } else {
+            Write-Log "Dry run: would execute $exeName in create mode, then set '$displayName' as default"
+        }
         Write-Log 'Dry run completed; no changes made'
         exit 0
     }
 
-    Write-Log "Executing: $exePath $($managerArgs -join ' ')"
-    $result = & $exePath $managerArgs 2>&1
-    $exitCode = $LASTEXITCODE
+    if (-not $addressBookExists) {
+        $managerArgs = @(
+            '-m', 'create',
+            '-f', $ConfigPath,
+            '-pm', 'default'
+        )
 
-    Write-Log "Exit code: $exitCode"
-    Write-Log "Output: $result"
+        Write-Log "Executing: $exePath $($managerArgs -join ' ')"
+        $result = & $exePath $managerArgs 2>&1
+        $exitCode = $LASTEXITCODE
+        $resultText = ($result | Out-String)
 
-    if ($exitCode -ne 0) {
-        Write-Log 'Deployment failed' 'ERROR'
-        exit $exitCode
+        Write-Log "Exit code: $exitCode"
+        Write-Log "Output: $resultText"
+
+        if ($exitCode -ne 0 -or $resultText -match 'FAILED!') {
+            Write-Log 'Deployment failed' 'ERROR'
+            if ($exitCode -ne 0) { exit $exitCode }
+            exit 1
+        }
+
+        # The MAPI tool returns success only if the profile now contains the
+        # address book. Confirm it before continuing.
+        $listResult = & $exePath -m list 2>&1
+        $listText = ($listResult | Out-String)
+        Write-Log "List output: $listText"
+        if ($listText -notmatch [regex]::Escape($displayName)) {
+            Write-Log "Address book '$displayName' was not found after create" 'ERROR'
+            exit 1
+        }
+    } else {
+        Write-Log "Address book '$displayName' already exists"
     }
 
-    # Mark as deployed. A failure here does not undo a successful AB creation.
+    # Make the LDAP address list the default directory and put it first in the
+    # name-resolution search path. This is idempotent and repairs profiles that
+    # already had the address book but never selected it as the default.
+    $helperArgs = @('-set', $displayName)
+    Write-Log "Executing: $helperPath $($helperArgs -join ' ')"
+    $helperResult = & $helperPath $helperArgs 2>&1
+    $helperExit = $LASTEXITCODE
+    $helperText = ($helperResult | Out-String)
+
+    Write-Log "Helper exit code: $helperExit"
+    Write-Log "Helper output: $helperText"
+
+    if ($helperExit -ne 0 -or $helperText -notmatch 'VERIFIED default and search order') {
+        Write-Log "Could not set '$displayName' as the default address book" 'ERROR'
+        if ($helperExit -ne 0) { exit $helperExit }
+        exit 1
+    }
+
+    # Mark as deployed. A failure here does not undo a successful change.
     try {
         New-Item -Path $regPath -Force -ErrorAction Stop | Out-Null
-        New-ItemProperty -Path $regPath -Name Version -Value '1.0' -PropertyType String -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path $regPath -Name Version -Value '2.0' -PropertyType String -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path $regPath -Name DefaultAddressBook -Value $displayName -PropertyType String -Force -ErrorAction Stop | Out-Null
         New-ItemProperty -Path $regPath -Name DeployedOn -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path $regPath -Name DefaultSetOn -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force -ErrorAction Stop | Out-Null
     } catch {
         Write-Log 'Could not write registry marker' 'WARN'
     }
 
-    Write-Log 'LDAP Address Book deployed successfully'
+    Write-Log 'LDAP Address Book deployed and set as default'
     exit 0
 } catch {
     Write-Log "Exception: $_" 'ERROR'

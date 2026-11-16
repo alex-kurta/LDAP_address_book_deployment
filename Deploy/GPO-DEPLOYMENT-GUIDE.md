@@ -1,71 +1,29 @@
 # GPO Deployment Guide: Outlook LDAP Address Book
 
-## Overview
+This guide walks through setting up the Outlook LDAP address book deployment
+from scratch on a new domain: configure, validate, copy the client package to
+NETLOGON, and create/link the GPO. Environment-specific values live in a local
+`.env` file; the package copied to the domain controller contains only a
+rendered `ABConfiguration.xml`, the client scripts, and the prebuilt
+executables — no `.env` and no credentials.
 
-This package deploys an LDAP address book to Outlook profiles through a Group
-Policy user logon script. Environment-specific values live in a local `.env`
-file on the administrative workstation. The deployment package that is copied
-to the domain controller contains only a rendered `ABConfiguration.xml`, the
-client scripts, and the two LdapABManager executables — no `.env` and no
-credentials.
-
-Copying the client package to NETLOGON does **not** create or link the GPO. The
-GPO must be created and linked separately, either from a workstation with RSAT
-or remotely through WinRM.
-
-## Current Status (reference deployment, verified 2026-11-13)
-
-This section describes the validated reference deployment. Environment-specific
-host names, domain names, GPO identifiers, and account names have been removed
-from this public document.
-
-| Item | Status |
-|------|--------|
-| `Outlook LDAP Address Book Deployment` GPO | **Created** and linked |
-| GPO link | **Enabled** at the domain root (not enforced) |
-| User logon script | `User\Scripts\psscripts.ini`, UTF-16LE with BOM |
-| Scripts client-side extension | Registered in `gPCUserExtensionNames` |
-| `Run logon scripts synchronously` | Enabled (`RunLogonScriptSync=1`) |
-| GPO report | Includes `\\<DC_SERVER>\NETLOGON\LdapABDeploy\Deploy-LdapAB.ps1` |
-| GPO applies on the reference workstation | **Yes** |
-| Address book on the reference workstation | Deployed (`%TEMP%\LdapABDeploy.log`, registry marker present) |
-| NETLOGON client package | Refreshed; matches the repository and `.env`, no credentials |
-| `TARGET_OU` | Configured OU did not exist; domain-root linking was used instead |
-| RSAT on the administrative workstation | Not installed |
-| WinRM to the domain controller | Working with the deployment credentials |
-| GroupPolicy module on the domain controller | Installed (Windows Server 2016; use `Get-GPInheritance`) |
-| Secondary Samba DC | SMB session setup failed; SYSVOL mirror was empty (superseded — see "Current Status Addendum (verified 2026-11-16)") |
-
-### Known infrastructure limitation: Samba SYSVOL mirror
-
-One reference-environment domain controller was a **Samba DC**, so Windows-only
-tools such as `dcdiag`, `dfsrdiag`, WMI, and WinRM did not apply to it. Its
-SYSVOL was populated by a **robocopy mirror** from the Windows DC, not by DFSR.
-
-The Samba SMB service rejected session setup with **"The security ID structure
-is invalid"** for both a standard user and a domain admin, so its SYSVOL and
-NETLOGON shares were unreachable and the mirror was empty. The scheduled
-robocopy task on the Windows DC had also been running since the previous
-failure; because it was configured with `MultipleInstances=IgnoreNew`, later
-retries were skipped.
-
-The domain-based SYSVOL path resolved to the healthy Windows DC, so the GPO
-applied on the reference workstation. Clients whose DFS referral landed on the
-Samba DC could not read `gpt.ini` and would fail policy processing until the
-Samba SMB service and SID mapping were repaired and the mirror was refreshed.
-That infrastructure work is outside this deployment package.
+Copying the client package to NETLOGON does **not** create or link the GPO.
+The GPO is created separately, either through the scripts in `Deploy/` or
+manually in `gpmc.msc`.
 
 ## Prerequisites
 
-- Windows PowerShell 5.1 or later
+- Windows PowerShell 5.1 or later on the administrative workstation
 - Outlook installed on target clients
-- One of these paths for GPO creation:
-  - RSAT Group Policy tools on the workstation running the script, or
-  - WinRM access to a domain controller that has the GroupPolicy module
+- One of these for GPO creation:
+  - RSAT Group Policy tools on the workstation, or
+  - WinRM access to a domain controller with the GroupPolicy module
 - Write access to the domain controller's NETLOGON share
-- A filled-in `.env` file (copy `.env.example`)
+- An account with domain logon rights for the NETLOGON copy and (if used) the
+  WinRM connection. Blank `USERNAME`/`PASSWORD` in `.env` uses your current
+  account.
 
-## 1. Configure .env
+## 1. Configure `.env`
 
 ```powershell
 Copy-Item .env.example .env
@@ -90,42 +48,37 @@ Optional keys:
 - `GPO_NAME` — defaults to `Outlook LDAP Address Book Deployment`
 - `USERNAME` / `PASSWORD` — used for the NETLOGON SMB copy and the WinRM GPO
   connection. Leave blank to use the current Windows account.
+- `DOMAIN_FQDN` / `NETBIOS_DOMAIN` — set explicitly when `DOMAIN` is a
+  NetBIOS name and cannot be derived from `TARGET_OU`
 
-For company-wide deployment, use `-LinkAtDomainRoot`. It derives the domain
+For company-wide deployment, pass `-LinkAtDomainRoot`; it derives the domain
 distinguished name from `DOMAIN` or `TARGET_OU` and overrides the configured
-`TARGET_OU` link scope.
-
-`DOMAIN` may be a NetBIOS name. When it does not contain a dot, the scripts
-derive the DNS domain from `TARGET_OU` (for example,
-`OU=Users,DC=example,DC=com` becomes `example.com`). You can also set
-`DOMAIN_FQDN` and `NETBIOS_DOMAIN` explicitly.
+`TARGET_OU` link scope. Use a pilot OU (`-TargetOU`) first if you want to
+validate on a subset of users.
 
 > Do not commit `.env`. It is gitignored.
 
 ## 2. Validate the configuration
 
-Run the safe smoke test before deploying:
-
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Deploy\Test-Configuration.ps1
 ```
 
-The test:
+The smoke test (changes nothing in Outlook or the registry):
 
-- loads `.env` and validates the required values without printing them
+- loads `.env` and validates required values without printing them
 - derives and checks the domain and NETLOGON paths
 - renders `ABConfiguration.xml` into a temporary directory
-- checks that the rendered config uses Secure Password Authentication and has
-  no embedded credentials
+- checks the rendered config uses Secure Password Authentication and has
+  embedded credentials empty
 - runs `Deploy-LdapAB.ps1` and `Remove-LdapAB.ps1` in `-DryRun` mode
-- runs `Deploy-All.ps1 -SkipConnectivityTest -SkipCopy` to validate package generation
+- runs `Deploy-All.ps1 -SkipConnectivityTest -SkipCopy` to validate package
+  generation
 - parses every PowerShell script for syntax errors
-- verifies that `.env` is untracked and that tracked files contain no obvious
-  token, IP-address, or password literals
+- verifies `.env` is untracked and tracked files contain no obvious token,
+  IP-address, or password literals
 
-The test does not modify Outlook or the registry.
-
-## 3. Deploy the package
+## 3. Deploy the client package
 
 ```powershell
 .\Deploy\Deploy-All.ps1
@@ -138,7 +91,7 @@ Useful parameters:
 .\Deploy\Deploy-All.ps1 -DomainController dc01.example.com -TargetOU 'OU=Pilot,DC=example,DC=com'
 .\Deploy\Deploy-All.ps1 -SkipConnectivityTest
 
-# Validate .env, render the package, and skip all network/GPO changes:
+# Validate and render only; copy nothing:
 .\Deploy\Deploy-All.ps1 -SkipConnectivityTest -SkipCopy
 ```
 
@@ -149,73 +102,133 @@ folder and copies only these files to `\\<DC_SERVER>\NETLOGON\LdapABDeploy`:
 ABConfiguration.xml
 Deploy-LdapAB.ps1
 Remove-LdapAB.ps1
+Run-LdapAB.cmd
 LdapABManager_x86.exe
 LdapABManager_x64.exe
+SetLdapABDefault_x86.exe
+SetLdapABDefault_x64.exe
 ```
 
 The administrative scripts and `.env` are not copied.
 
 If the GroupPolicy module is available locally, `Deploy-All.ps1` also creates,
-links, and configures the GPO. If the module is not installed, use the remote
-script in step 4 after the copy completes.
+links, and configures the logon-script GPO (Option B). If it is not installed,
+configure the GPO in step 4 after the copy completes.
 
-## ABConfiguration.xml Settings
+## 4. Create and link the GPO
 
-`Deploy-LdapAB.ps1` reads this file on the client. The deployment script fills
-in the display name, server, port, and SSL setting from `.env`:
+Choose one mechanism. Both run the same client package.
+
+| Mechanism | Behavior | Use when |
+|-----------|----------|----------|
+| A. Scheduled task (recommended) | Hidden launch at logon + 15-minute repeat while logged on; Windows 10 1809+ targeting | You want already-logged-on sessions to pick up the deployment |
+| B. User logon script | Runs once at each logon; set up automatically by the scripts | You prefer a simple, scriptable path |
+
+### Option A: scheduled task preference (recommended)
+
+1. In **Group Policy Management** (`gpmc.msc`), right-click the domain root
+   (company-wide) or a pilot OU → **Create a GPO in this domain, and Link it
+   here**. Name it (or use the value of `GPO_NAME`).
+2. Edit the GPO → **User Configuration → Preferences → Control Panel Settings
+   → Scheduled Tasks** → **New → Scheduled Task (At least Windows Vista)**.
+   Set the action on the **General** tab to:
+   - Name: `Outlook LDAP Address Book Deployment`
+   - Security options: **Run only when user is logged on**; **Do not store
+     password**; do **not** check *Run with highest privileges*
+   - The task runs as the user to whom the preference item applies, with an
+     interactive token and least privilege.
+3. On the **Triggers** tab, add:
+   - **At log on** — any user, delay **1 minute**
+   - A **daily** trigger with **Repeat task every: 15 minutes** for
+     **Indefinitely** (keeps already-logged-on sessions current)
+4. On the **Actions** tab, **Start a program**:
+   - Program: `C:\Windows\System32\conhost.exe`
+   - Arguments: `--headless cmd.exe /c "\\<DOMAIN>\NETLOGON\LdapABDeploy\Run-LdapAB.cmd"`
+   - `conhost.exe --headless` runs the wrapper with no visible console window.
+     It exists only on Windows 10 version 1809 and later.
+5. On the **Settings** tab:
+   - If the task is already running: **Do not start a new instance**
+   - **Start the task as soon as possible after a scheduled start is missed**
+   - **Stop the task if it runs longer than 1 hour**
+6. On the **Common** tab:
+   - Check **Remove this item when it is no longer applied**
+   - Open **Item-level targeting** → **New → WMI query** and set:
+     - Namespace: `Root\cimv2`
+     - Query: `SELECT * FROM Win32_OperatingSystem WHERE Version >= '10.0.17763'`
+   - This restricts the item to Windows 10 1809+/Windows 11 and removes the
+     task from clients that no longer match.
+7. **Apply**, then close the editor. Clients apply the item at the next
+   background refresh or logon; `gpupdate /target:user /force` on a test
+   machine forces immediate application.
+
+The resulting `User\Preferences\ScheduledTasks\ScheduledTasks.xml` on SYSVOL
+resembles the following (GPMC generates `uid`/`changed` automatically; `<DOMAIN>`
+is your DNS domain name):
 
 ```xml
-<ABConfiguration>
-  <DisplayName>Company Directory</DisplayName>
-  <ServerName>ldap.example.com</ServerName>
-  <ServerPort>389</ServerPort>
-  <UseSSL>False</UseSSL>
-  <Username></Username>
-  <Password></Password>
-  <RequireSecurePasswordAuth>True</RequireSecurePasswordAuth>
-  <SearchTimeoutSeconds>60</SearchTimeoutSeconds>
-  <MaxEntriesReturned>500</MaxEntriesReturned>
-  <DefaultSearchBase>True</DefaultSearchBase>
-  <CustomSearchBase></CustomSearchBase>
-  <EnableBrowsing>True</EnableBrowsing>
-</ABConfiguration>
+<?xml version="1.0" encoding="utf-8"?>
+<ScheduledTasks clsid="{CC63F200-7309-4ba0-B154-A71CD118DBCC}">
+  <TaskV2 clsid="{D8896631-B747-47a7-84A6-C155337F3BC8}"
+          name="Outlook LDAP Address Book Deployment"
+          image="0" uid="{00000000-0000-0000-0000-000000000000}"
+          userContext="0" removePolicy="1"
+          desc="Deploys the Outlook LDAP address book at logon and every 15 minutes while the user is logged on.">
+    <Properties action="U" name="Outlook LDAP Address Book Deployment"
+                runAs="%LogonDomain%\%LogonUser%" logonType="InteractiveToken">
+      <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+        <Triggers>
+          <LogonTrigger>
+            <Enabled>true</Enabled>
+            <Delay>PT1M</Delay>
+          </LogonTrigger>
+          <CalendarTrigger>
+            <Enabled>true</Enabled>
+            <Repetition>
+              <Interval>PT15M</Interval>
+              <StopAtDurationEnd>false</StopAtDurationEnd>
+            </Repetition>
+            <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+          </CalendarTrigger>
+        </Triggers>
+        <Principals>
+          <Principal id="Author">
+            <UserId>%LogonDomain%\%LogonUser%</UserId>
+            <LogonType>InteractiveToken</LogonType>
+            <RunLevel>LeastPrivilege</RunLevel>
+          </Principal>
+        </Principals>
+        <Actions Context="Author">
+          <Exec>
+            <Command>C:\Windows\System32\conhost.exe</Command>
+            <Arguments>--headless cmd.exe /c "\\<DOMAIN>\NETLOGON\LdapABDeploy\Run-LdapAB.cmd"</Arguments>
+          </Exec>
+        </Actions>
+      </Task>
+    </Properties>
+    <Filters>
+      <FilterWmi bool="AND" not="0" nameSpace="Root\cimv2"
+                query="SELECT * FROM Win32_OperatingSystem WHERE Version &gt;= '10.0.17763'"/>
+    </Filters>
+  </TaskV2>
+</ScheduledTasks>
 ```
 
-Key settings:
+If you verify the file instead of creating the item through the GUI, confirm
+`removePolicy="1"`, the `conhost.exe --headless` action, and the
+`FilterWmi` query are present. If you hand-edit the XML on SYSVOL, clients
+pick up the change at the next background refresh (or after `gpupdate`).
 
-- `RequireSecurePasswordAuth=True` uses the signed-in user's domain credentials.
-- `Username` and `Password` stay empty; the deployment account is never written
-  to the client configuration.
-- A new address book is normally created at position #0 in Outlook's search
-  order.
+### Option B: user logon script (automated)
 
-## 4. Create or link the GPO
-
-Copying files to NETLOGON is not enough. The GPO must be created, linked, and
-given the logon script. The GPO in this environment is already created and
-linked; use this section to update it, recreate it, or change the link scope.
-
-Choose the link scope first:
-
-| Scope | Link target | Effect |
-|-------|-------------|--------|
-| Company-wide | Domain root (for example, `DC=example,DC=com`) | Applies to all users in the domain unless an OU blocks inheritance |
-| Pilot | A real OU distinguished name | Applies only to users in that OU |
-
-> In the reference environment, the configured `TARGET_OU` did not exist. A
-> link command against a missing OU fails. Use `-LinkAtDomainRoot` for
-> company-wide deployment, or pass an existing OU with `-TargetOU`.
-
-### Option A: remote from a workstation without RSAT
-
-`Configure-LdapAB-GPO-Remote.ps1` uses WinRM and the deployment credentials in
-`.env` to run the GroupPolicy cmdlets on the domain controller. Preview first:
+For a workstation without RSAT, `Configure-LdapAB-GPO-Remote.ps1` uses WinRM
+and the deployment credentials in `.env` to run the GroupPolicy cmdlets on
+the domain controller. Preview first:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Deploy\Configure-LdapAB-GPO-Remote.ps1 -DryRun -LinkAtDomainRoot
 ```
 
-Then apply it company-wide:
+Then apply it:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Deploy\Configure-LdapAB-GPO-Remote.ps1 -LinkAtDomainRoot
@@ -227,77 +240,136 @@ For a pilot OU instead:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Deploy\Configure-LdapAB-GPO-Remote.ps1 -TargetOU 'OU=Pilot,DC=example,DC=com'
 ```
 
-The script:
-
-- creates the GPO if it does not exist
-- links it to the domain root or the specified OU
-- writes the user logon script to `User\Scripts\psscripts.ini` as UTF-16LE
-  with a byte order mark (the Scripts CSE ignores other encodings and the old
-  `Scripts\Logon` path)
-- registers the Scripts client-side extension in the GPO
-- enables **Run logon scripts synchronously**
-- bumps the GPO user version and updates `gpt.ini` so clients process the change
-- refuses to overwrite an existing GPO that already has other logon scripts
-
-Rerunning the script is safe; it updates the existing GPO in place.
-
-The deployment password is used only for the WinRM connection and is never
-printed or written to the policy files.
-
-### Option B: on a domain controller or RSAT workstation
+On a domain controller or RSAT workstation:
 
 ```powershell
-# Company-wide, linked at the domain root
 .\Deploy\Configure-LdapAB-GPO.ps1 -LinkAtDomainRoot
-
-# Pilot OU
+# or
 .\Deploy\Configure-LdapAB-GPO.ps1 -TargetOU 'OU=Pilot,DC=example,DC=com'
 ```
 
-`Deploy-All.ps1` also runs this configuration automatically when the
-GroupPolicy module is available locally.
+The scripts:
 
-### Option C: manual GPMC steps
+- create the GPO if it does not exist
+- link it to the domain root or the specified OU
+- write the user logon script to `User\Scripts\psscripts.ini` as UTF-16LE
+  with a byte-order mark (the Scripts CSE ignores other encodings and the
+  `Scripts\Logon` path)
+- register the Scripts client-side extension in the GPO
+- enable **Run logon scripts synchronously**
+- bump the GPO user version and update `gpt.ini` so clients process the change
+- refuse to overwrite an existing GPO that already has other logon scripts
+
+Rerunning is safe; the GPO is updated in place. The deployment password is
+used only for the WinRM connection and is never printed or written to the
+policy files.
+
+Logon scripts run at logon only; they do not repeat on already-logged-on
+sessions and do not run hidden for this mechanism — use Option A if you need
+either property.
+
+### Option C: logon script (manual GPMC)
 
 1. Open **Group Policy Management** (`gpmc.msc`).
-2. Right-click the domain root (company-wide) or a pilot OU → **Create a GPO in
-   this domain, and Link it here**.
-3. Name it (or use the value of `GPO_NAME`).
-4. Edit the GPO → **User Configuration → Policies → Windows Settings → Scripts
-   (Logon/Logoff)**.
-5. Open **Logon** → **PowerShell Scripts** → **Add**.
-6. Script name: `\\<DC_SERVER>\NETLOGON\LdapABDeploy\Deploy-LdapAB.ps1`.
-7. Leave parameters empty; the script uses its own folder for the config and
-   executables.
-8. Enable **User Configuration → Policies → Administrative Templates → System →
-   Scripts → Run logon scripts synchronously**.
-
-### Synchronous execution (recommended)
-
-The automated scripts set the user policy
-`HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System\RunLogonScriptSync`
-to `1`. This gives the Outlook profile time to exist before the script runs.
-The same policy is available under **User Configuration** or **Computer
-Configuration → Administrative Templates → System → Scripts**.
+2. Right-click the domain root (company-wide) or a pilot OU → **Create a GPO
+   in this domain, and Link it here**. Name it (or use the value of `GPO_NAME`).
+3. Edit the GPO → **User Configuration → Policies → Windows Settings →
+   Scripts (Logon/Logoff)** → **Logon** → **PowerShell Scripts** → **Add**.
+4. Script name: `\\<DC_SERVER>\NETLOGON\LdapABDeploy\Deploy-LdapAB.ps1`.
+   Leave parameters empty.
+5. Enable **User Configuration → Policies → Administrative Templates → System
+   → Scripts → Run logon scripts synchronously**.
 
 ### Security filtering
 
 The default **Authenticated Users** filter applies the GPO to everyone in the
 linked scope. Restrict it to a pilot security group if needed.
 
-## Verification Checklist
+## 5. How the client side works
+
+`Deploy-LdapAB.ps1` reads the pre-rendered `ABConfiguration.xml` on the
+client; it does not read `.env` and contains no credentials. The script:
+
+- detects Outlook bitness (x86/x64) and selects the matching prebuilt
+  executables (`LdapABManager_*.exe`, `SetLdapABDefault_*.exe`)
+- creates or updates the LDAP address book as **Secure Password Authentication**
+  with the signed-in user's credentials (`RequireSecurePasswordAuth=True`,
+  empty username/password)
+- runs `SetLdapABDefault` to make the new address book the default directory
+  and the first entry in the address-book search path
+- writes a registry marker `HKCU\Software\<DOMAIN>\LdapABDeploy` and logs to
+  `%TEMP%\LdapABDeploy.log`
+- exits without changes in `-DryRun` mode
+
+`LdapABManager_ABConfiguration.xml` documents every supported setting. To
+build the executables from source instead of using the prebuilt binaries:
+
+- `LdapABManager_Code/` — Visual Studio C++ MAPI sample (Windows SDK MAPI)
+- `SetLdapABDefault_Code/SetLdapABDefault.cpp` — MinGW:
+  `x86_64-w64-mingw32-g++ -O2 -municode -static -static-libgcc -static-libstdc++ -o SetLdapABDefault_x64.exe SetLdapABDefault.cpp -lmapi32 -lole32 -loleaut32`
+  (use the 32-bit toolchain for the `x86` binary)
+
+## Verification checklist
 
 | Test | Method | Expected result |
 |------|--------|-----------------|
 | GPO exists | `Get-GPO -Name 'Outlook LDAP Address Book Deployment'` on the DC | GPO is returned |
 | GPO linked | `Get-GPInheritance -Target 'DC=example,DC=com'` on the DC | GPO appears in `GpoLinks` |
-| Logon script configured | Check `psscripts.ini` in the GPO's SYSVOL folder | Contains `Deploy-LdapAB.ps1` |
-| Policy applied | `gpresult /r` on a client | GPO is listed under user policy |
-| Script runs | `%TEMP%\LdapABDeploy.log` | Exit code 0, "deployed successfully" |
+| Task present (Option A) | `schtasks /query /tn 'Outlook LDAP Address Book Deployment'` on a client | Action is `conhost.exe --headless ...` |
+| Policy applied | `gpresult /r` on a client | GPO listed under user policy |
+| Script ran | `%TEMP%\LdapABDeploy.log` | Last line: `LDAP Address Book deployed and set as default` |
 | AB created | Outlook → Address Book → Tools → Options | Configured display name is listed |
-| Default AB | Open Address Book (`Ctrl+Shift+B`) | New address book appears first |
+| AB is default | Open Address Book (`Ctrl+Shift+B`) | New address book appears first |
 | Search works | Type a name in the **To:** field | Resolves from AD |
-| Re-run idempotent | Log off and on again | Log shows "Already deployed, skipping" |
+| Re-run is idempotent | Log off and on again | Log shows normal redeploy with no duplicates |
+| Legacy client (Option A) | `gpresult /r` | Off-filter client registers no task |
+
+## Troubleshooting
+
+### Script fails with "Outlook not found"
+
+- Verify Outlook is installed.
+- Check `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE`.
+- The client script auto-detects Outlook bitness and selects the matching
+  executables.
+
+### Address book is created but not default
+
+- The deployment runs `SetLdapABDefault`, which places the address book at
+  search index #0 and sets it as the default directory.
+- If it is not first, check Outlook's "Choose automatically" setting:
+  `HKCU\Software\Microsoft\Office\16.0\Outlook\Options\General\ABChooseDirAutomatically = 0`.
+
+### Connection fails
+
+- Verify the LDAP port is reachable from client VLANs to the LDAP server.
+- Test with `ldp.exe` or `Test-NetConnection <LDAP_SERVER> -Port <LDAP_PORT>`.
+- Check the firewall on the LDAP server.
+
+### Duplicate address books on re-run
+
+- The script checks for an existing address book by display name and skips
+  re-creation; it re-verifies the default position on every run.
+- The registry marker `HKCU\Software\<DOMAIN>\LdapABDeploy` records the
+  deployed version.
+
+### Users see a flashing console window (Option A)
+
+- The task action must be `conhost.exe --headless ...`, not `cmd.exe`.
+- Confirm the item-level WMI filter is present and the client is at or above
+  the target build.
+- Force a refresh in the affected user's session: `gpupdate /target:user /force`,
+  then log off and on.
+
+### GPO does not apply
+
+- `gpresult /r` and `gpresult /h report.html` on the client; check security
+  filtering and WMI filters.
+- From client VLANs, verify SYSVOL reachability (`\\<DOMAIN>\SYSVOL`); on
+  multi-DC environments confirm every DC serves the same `gpt.ini` and the
+  GPO's preference files.
+- Logon-script GPOs need the Scripts CSE registered (see Option B) and
+  UTF-16LE `psscripts.ini`; other encodings are ignored.
 
 ## Rollback
 
@@ -306,7 +378,6 @@ linked scope. Restrict it to a pilot security group if needed.
 Unlink the GPO from the domain root or OU, or disable the link:
 
 ```powershell
-# Run on a domain controller or RSAT workstation
 Remove-GPLink -Name 'Outlook LDAP Address Book Deployment' -Target 'DC=example,DC=com'
 ```
 
@@ -316,98 +387,37 @@ To remove the GPO entirely:
 Remove-GPO -Name 'Outlook LDAP Address Book Deployment'
 ```
 
-### Run the removal script
+To remove only the scheduled-task item (Option A): edit the GPO and delete the
+preference item. Clients with `removePolicy="1"` drop their local task
+automatically off-filter or after the item is deleted.
+
+### Remove the address book on clients
 
 ```powershell
 \\<DC_SERVER>\NETLOGON\LdapABDeploy\Remove-LdapAB.ps1
 ```
 
-### Manual cleanup per user
-
-```powershell
-# Replace <DOMAIN> with the user's NetBIOS domain name.
-Remove-Item "HKCU:\Software\<DOMAIN>\LdapABDeploy" -Recurse -Force
-```
-
-## Troubleshooting
-
-### Script fails with "Outlook not found"
-
-- Verify Outlook is installed.
-- Check `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE`.
-
-### Address book is created but not default
-
-- The tool places a new address book at search index #0.
-- If it is not first, check Outlook's "Choose automatically" setting:
-  `HKCU\Software\Microsoft\Office\16.0\Outlook\Options\General\ABChooseDirAutomatically = 0`.
-
-### Connection fails
-
-- Verify the LDAP port is reachable from client VLANs to the LDAP server.
-- Test with `ldp.exe` or `Test-NetConnection <LDAP_SERVER> -Port <LDAP_PORT>`.
-- Check the Windows Firewall on the LDAP server.
-
-### Duplicate address books on re-run
-
-- The client script checks the registry marker
-  `HKCU\Software\<DOMAIN>\LdapABDeploy`.
-- LdapABManager also checks for an existing address book by display name.
-
-### x86/x64 mismatch
-
-- The client script auto-detects Outlook bitness and selects the matching
-  executable.
+The script logs `LDAP Address Book removed successfully` and removes the
+registry marker. To clean up manually per user, remove
+`HKCU\Software\<DOMAIN>\LdapABDeploy`.
 
 ## Requirements
 
 - **LDAP server**: reachable on the configured port
-- **Clients**: Outlook 2016/2019/2021/365 (x86 or x64)
-- **Permissions**: domain users need read access to AD
-- **PowerShell**: 3.0+ (5.1 recommended)
+- **Clients**: Outlook 2016/2019/2021/Microsoft 365 (x86 or x64); Windows
+  10 1809+ or Windows 11 for Option A
+- **Permissions**: domain users need read access to the directory
+- **PowerShell**: 3.0+ on clients (5.1 recommended)
 
-## Testing Before Full Rollout
-
-1. Run `Test-Configuration.ps1`.
-2. Test `Deploy-LdapAB.ps1` manually on one machine.
-3. Verify the address book in Outlook and test a name lookup.
-4. Link the GPO to a pilot OU first.
-5. Monitor `%TEMP%\LdapABDeploy.log` on pilot machines.
-6. Roll out to production OUs after the pilot succeeds.
-
-## Log Locations
+## Log locations
 
 - **Deployment log**: `%TEMP%\LdapABDeploy.log`
 - **Removal log**: `%TEMP%\LdapABRemove.log`
 - **Registry marker**: `HKCU\Software\<DOMAIN>\LdapABDeploy`
+- **Package copy staging**: `%LOCALAPPDATA%\LdapABDeploy`
 
-## Current Status Addendum (verified 2026-11-16)
-
-The Samba SYSVOL mirror limitation described above is **resolved**: the
-Windows-to-Samba robocopy mirror task has been run and SYSVOL hashes now
-match on both DCs. The scheduled-task preference that actually drives the
-deployment has been hardened:
-
-| Item | Status |
-|------|--------|
-| Task launcher | `conhost.exe --headless cmd.exe /c "...\Run-LdapAB.cmd"` — no console window |
-| OS targeting | Item-level WMI targeting, `Version >= '10.0.17763'` (Windows 10 1809+/11); item removes itself off-filter |
-| GPO version | `393221` on both DCs (AD `versionNumber` and `GPT.INI` agree; `ntacl sysvolcheck` passes) |
-| Clients confirmed | Reference clients verified running hidden with result `0` |
-| Legacy clients | Server 2016 DC stale task stopped/removed; no task is re-created off-filter |
-| Client default AB | `VERIFIED default and search order` in `%TEMP%\LdapABDeploy.log` |
-
-If a client still shows a console window, force `gpupdate /target:user /force`
-in that user's session and confirm the control-flow: task action should be
-`conhost.exe --headless`. See `DEPLOYMENT_PROCESS.md` → "Addendum: Production
-hardening (2026-11-16)" for the full record.
-
-## Version History
+## Version history
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 1.4 | 2026-11-16 | Samba SYSVOL mirror repaired and verified; hidden `conhost.exe --headless` task launcher; Windows 10 1809+ WMI item-level targeting with removePolicy; GPO version `393221`; clients confirmed hidden; stale Server 2016 task removed |
-| 1.3 | 2026-11-13 | GPO created and linked at the domain root; corrected `psscripts.ini` path, UTF-16LE encoding, Scripts CSE registration, and version handling; documented a Samba SYSVOL mirror limitation observed in the reference environment |
-| 1.2 | 2026-11-12 | Corrected GPO status; added WinRM remote GPO script; fixed link checks; documented missing `TARGET_OU` |
-| 1.1 | 2026-11-12 | `.env`-driven configuration, safe smoke test, sanitized package |
-| 1.0 | 2026-11-11 | Initial deployment package |
+| 2.0 | 2026-11-16 | Setup-only documentation; hidden `conhost.exe --headless` launcher; Windows 10 1809+ WMI item-level targeting with remove-off-filter; `SetLdapABDefault` helper; `%LOGONSERVER%`-relative wrapper |
