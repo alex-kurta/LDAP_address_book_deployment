@@ -301,10 +301,15 @@ client; it does not read `.env` and contains no credentials. The script:
   `%TEMP%\LdapABDeploy.log`
 - exits without changes in `-DryRun` mode
 
-`LdapABManager_ABConfiguration.xml` documents every supported setting. To
-build the executables from source instead of using the prebuilt binaries:
+`LdapABManager_ABConfiguration.xml` documents every supported setting. The
+`LdapABManager_*.exe` files are prebuilt Microsoft "LdapABManager" sample
+binaries, redistributed as object code only (see `THIRD-PARTY-NOTICES.md`);
+their source is not included or redistributed. To rebuild them, obtain the
+sample from Microsoft and install the Microsoft Outlook 2010-or-later MAPI
+headers, then build with Visual Studio C++ targeting x86 and x64.
+`SetLdapABDefault_Code/SetLdapABDefault.cpp` is this project's own source; to
+build it instead of using the prebuilt binaries:
 
-- `LdapABManager_Code/` — Visual Studio C++ MAPI sample (Windows SDK MAPI)
 - `SetLdapABDefault_Code/SetLdapABDefault.cpp` — MinGW:
   `x86_64-w64-mingw32-g++ -O2 -municode -static -static-libgcc -static-libstdc++ -o SetLdapABDefault_x64.exe SetLdapABDefault.cpp -lmapi32 -lole32 -loleaut32`
   (use the 32-bit toolchain for the `x86` binary)

@@ -66,9 +66,9 @@ in the guide; both mechanisms run the same client package.
 | `Deploy/Run-LdapAB.cmd` | Client wrapper: copies package locally, runs deploy script |
 | `Deploy/SetLdapABDefault_x86/x64.exe` | MAPI helper: sets default address book + search order |
 | `SetLdapABDefault_Code/` | C++ source for the helper (MinGW build commands included) |
-| `LdapABManager_Code/` | C++ source for the MAPI address-book tool (Microsoft MAPI sample) |
-| `LdapABManager_Exe/` | Prebuilt x86/x64 MAPI executables (same binaries as `Deploy/`) |
+| `LdapABManager_Exe/` | Prebuilt x86/x64 executables of Microsoft's LDAP MAPI sample (object code; see notices) |
 | `LdapABManager_ABConfiguration.xml` | Sanitized configuration template |
+| `THIRD-PARTY-NOTICES.md` | Copyright/terms for the Microsoft LdapABManager binaries |
 | `.env.example` | Template for local configuration |
 
 ## Verification
@@ -93,6 +93,14 @@ in the guide; both mechanisms run the same client package.
 - The deployment account in `.env` is used only for the SMB copy to NETLOGON
   and the WinRM connection used to create the GPO. It is never rendered into
   `ABConfiguration.xml`.
+
+## Third-party components
+
+The `LdapABManager_*.exe` executables are Microsoft's prebuilt "LdapABManager"
+sample binaries, redistributed as object code only under the sample-code terms
+of the Agreement for Microsoft Services; the sample source is not redistributed.
+See `THIRD-PARTY-NOTICES.md` for copyright, checksums, and rebuild
+prerequisites. `SetLdapABDefault` (source included) is this project's own work.
 - The client configuration uses `RequireSecurePasswordAuth=True` with empty
   username and password fields.
 - If a credential was ever committed or pushed, rotate it before continuing.
